@@ -1,0 +1,20 @@
+{
+  "name": "solana-auth-backend-example",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Conceptual example: Solana auth + C2F provisioning",
+  "main": "solana-auth.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.4",
+    "tweetnacl": "^1.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
