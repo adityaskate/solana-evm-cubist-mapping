@@ -526,7 +526,9 @@ cs key create --key-type secp --metadata '{"name":"EVM_TestUser123"}'
 }
 ```
 
-![Step 1 Screenshot]
+<img width="2940" height="874" alt="image" src="https://github.com/user-attachments/assets/8ec95c40-d537-4274-b2b4-a74becadda62" />
+
+
 
 ---
 
@@ -552,7 +554,7 @@ cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb
 }
 ```
 
-![Step 2 Screenshot]
+<img width="2926" height="596" alt="image" src="https://github.com/user-attachments/assets/23ebd81e-ad92-4f22-b6c0-f1aaba7f6088" />
 
 ---
 
@@ -580,7 +582,7 @@ cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb
 
 ✅ All chains map to the same EVM address!
 
-![Step 3 Screenshot]
+<img width="2924" height="514" alt="image" src="https://github.com/user-attachments/assets/bb902613-71a7-468a-aa4a-a004817d7809" />
 
 ---
 
@@ -605,7 +607,7 @@ cs key create --key-type secp --metadata '{"name":"EVM_7xKXtg_chain137"}'
 }
 ```
 
-![Step 4 Screenshot]
+<img width="2926" height="800" alt="image" src="https://github.com/user-attachments/assets/95c46707-77c6-49e0-be3d-7339e6bb5771" />
 
 ---
 
@@ -627,7 +629,7 @@ cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb
 }
 ```
 
-![Step 5 Screenshot]
+<img width="2940" height="632" alt="image" src="https://github.com/user-attachments/assets/f44f4d74-a590-4039-b2da-48b302048b36" />
 
 ---
 
@@ -655,6 +657,6 @@ cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb
 
 ✅ **Chain 137 updated to `0xb29db...`, chains 1 and 42161 unchanged!**
 
-![Step 6 Screenshot]
+<img width="2940" height="460" alt="image" src="https://github.com/user-attachments/assets/c8fa4de8-cfe6-4f0b-b484-756c246a7bc8" />
 
 ---
