@@ -1,6 +1,6 @@
 # Cubist Integration Specification
 
-**Purpose:** Define our requirements for Cubist C2F, KV store, and CubeSigner integration  
+**Purpose:** Define our requirements for Cubist WASM policies, KV store, and CubeSigner integration  
 **Audience:** Cubist team  
 **Date:** 2026-01-07
 
@@ -65,22 +65,20 @@ default:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU → 0xabc...def  # Used for
 | **Open bucket** | `keyvalue::open("solana_to_evm")` | Get bucket handle |
 | **Read** | `bucket.get(key)` → `Option<Value>` | Idempotent lookup |
 | **Atomic write** | `bucket.set(key, value, IfExists::Deny)` | First-writer-wins for defaults |
-| **Update** | `bucket.set(key, value, IfExists::Allow)` | Update chain-specific mapping |
+| **Update** | `bucket.set(key, value, IfExists::Overwrite)` | Update chain-specific mapping |
 
 ### Critical Requirements
 
 1. **Atomicity:** `IfExists::Deny` must be atomic (prevent race conditions)
 2. **Default Immutability:** Once a default address is created, it should not change
 3. **Chain Override Flexibility:** Individual chain mappings can be updated
-4. **Consistency:** All C2F instances must see the same KV state
+4. **Consistency:** All policy instances must see the same KV state
 5. **Error handling:** Clear error when `IfExists::Deny` fails (key exists)
 
 ### Questions for Cubist
 
 - Is `IfExists::Deny` implemented as compare-and-swap or equivalent?
-- What is the consistency model? (strong vs eventual)
 - Is there a TTL/expiration mechanism? (we don't need it, but want to ensure mappings are permanent)
-- Bucket creation: manual via UI or programmatic?
 
 ---
 
@@ -351,7 +349,7 @@ Comprehensive tests validate the following critical properties:
 | `test_atomicity_with_delete_attempt_before_write` | Attempting to delete then recreate fails - original mapping preserved |
 | `test_wallet_address_immutability` | Multiple provisions for the same (solana_pubkey, chain_id) always return the same EVM address |
 | `test_concurrent_provisions_first_writer_wins` | Concurrent requests for the same mapping result in one winner, all get same address |
-| `test_retry_after_race_condition` | Lost race conditions (orphaned keys) are handled correctly on retry |
+| `test_provision_can_add_new_chains_later` | Can provision additional chains after initial provision |
 
 #### **Default Address Behavior Tests**
 
@@ -365,9 +363,9 @@ Comprehensive tests validate the following critical properties:
 
 | Test | Behavior Validated |
 |------|-------------------|
-| `test_first_provision_creates_mapping` | Initial provision creates new EVM address |
-| `test_second_provision_returns_same_address` | Idempotent behavior - repeated calls return cached address |
-| `test_different_chains_get_different_addresses` | Same Solana key can have different addresses if updated per chain |
+| `test_provision_creates_wallet_for_all_chains` | Initial provision creates mappings for all specified chains |
+| `test_provision_is_idempotent` | Idempotent behavior - repeated calls return cached address |
+| `test_update_creates_new_wallet_for_specific_chain` | Same Solana key can have different addresses if updated per chain |
 | `test_different_solana_keys_get_different_addresses` | Different Solana keys → different EVM addresses |
 | `test_kv_key_format` | KV key format is correct |
 
@@ -396,15 +394,14 @@ Comprehensive tests validate the following critical properties:
 
 **✅ Atomicity Under Concurrency**
 - Multiple simultaneous requests for the same mapping:
-  - All create CubeSigner keys (unavoidable in distributed system)
   - Only one write succeeds (atomic KV operation)
-  - Losers retry and get the winning address
-  - Orphaned keys are acceptable (tradeoff for atomicity)
+  - First write wins for both default and chain-specific mappings
+  - System converges to consistent state
 
 **✅ Idempotency**
 - Calling provision with same parameters 1 time or 1000 times produces identical result
 - No side effects after first successful provision
-- Safe for retries at any layer (backend, C2F, KV)
+- Safe for retries at any layer (backend, policy, KV)
 
 ### Test Execution
 

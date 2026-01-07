@@ -1,2 +1,4 @@
-/target/policy/target
-target
+/target
+/policy/target
+*.wasm
+Cargo.lock
