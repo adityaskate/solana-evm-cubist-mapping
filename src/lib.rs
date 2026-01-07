@@ -19,7 +19,7 @@ use anyhow::{Result, anyhow};
 
 const MAPPING_BUCKET: &str = "solana_to_evm";
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub struct ProvisionRequest {
     pub solana_pubkey: String,
     pub chain_id: u64,
@@ -40,7 +40,8 @@ fn kv_key(solana_pubkey: &str, chain_id: u64) -> String {
 
 /// Idempotent read:
 /// If a mapping already exists, return it.
-#[allow(dead_code)]
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist C2F SDK.
 fn get_existing_mapping(
     _solana_pubkey: &str,
     _chain_id: u64,
@@ -62,7 +63,8 @@ fn get_existing_mapping(
 
 /// Atomic write:
 /// Store mapping only if it does not already exist.
-#[allow(dead_code)]
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist C2F SDK.
 fn store_mapping_once(
     _solana_pubkey: &str,
     _chain_id: u64,
@@ -90,7 +92,8 @@ fn store_mapping_once(
 ///
 /// This is intentionally isolated so that integration is mechanical.
 /// Once CubeSigner wiring is decided, only this function changes.
-#[allow(dead_code)]
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist CubeSigner SDK.
 fn create_cubesigner_evm_key(
     _solana_pubkey: &str,
     _chain_id: u64,
@@ -134,3 +137,4 @@ pub fn handle(req: ProvisionRequest) -> Result<ProvisionResponse> {
 
     Ok(ProvisionResponse { evm_address })
 }
+

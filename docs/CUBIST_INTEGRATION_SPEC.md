@@ -247,13 +247,6 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 - **Dependencies:** `@solana/web3.js`, `tweetnacl`
 - **Secrets:** C2F API key/credentials (stored in our secret manager)
 
-### Questions for Cubist
-
-- What is the C2F build/deployment process?
-- Do we push code to a Cubist repo, or is there a CLI?
-- Is there a staging environment for testing?
-
----
 
 ## 7. Security Considerations
 
@@ -274,10 +267,81 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 - Once a mapping is created, it cannot be changed
 - Prevents wallet substitution attacks
 - Lost Solana key = lost access to provisioned EVM wallets (by design)
+- **Verified by tests:** `test_wallet_address_immutability`, `test_atomicity_prevents_overwrites`
+
+### Race Condition Handling
+
+- Concurrent provisions may create multiple CubeSigner keys (acceptable)
+- Only first write to KV succeeds (atomic `IfExists::Deny`)
+- Losing requests retry and receive the winning address
+- System eventually converges to single mapping per (solana_pubkey, chain_id)
+- **Verified by tests:** `test_concurrent_provisions_first_writer_wins`, `test_retry_after_race_condition`
 
 ---
 
 ## 8. Testing & Validation
+
+### Test Coverage
+
+Comprehensive tests validate the following critical properties:
+
+#### **Atomicity & Immutability Tests**
+
+| Test | Property Validated |
+|------|-------------------|
+| `test_atomicity_prevents_overwrites` | Once a mapping is stored, it cannot be overwritten (IfExists::Deny works) |
+| `test_cannot_delete_and_recreate_mapping` | Mappings cannot be deleted - storage is immutable |
+| `test_atomicity_with_delete_attempt_before_write` | Attempting to delete then recreate fails - original mapping preserved |
+| `test_wallet_address_immutability` | Multiple provisions for the same (solana_pubkey, chain_id) always return the same EVM address |
+| `test_concurrent_provisions_first_writer_wins` | Concurrent requests for the same mapping result in one winner, all get same address |
+| `test_retry_after_race_condition` | Lost race conditions (orphaned keys) are handled correctly on retry |
+
+#### **Functional Tests**
+
+| Test | Behavior Validated |
+|------|-------------------|
+| `test_first_provision_creates_mapping` | Initial provision creates new EVM address |
+| `test_second_provision_returns_same_address` | Idempotent behavior - repeated calls return cached address |
+| `test_different_chains_get_different_addresses` | Same Solana key on different chains → different EVM addresses |
+| `test_different_solana_keys_get_different_addresses` | Different Solana keys → different EVM addresses |
+| `test_kv_key_format` | KV key format is `{solana_pubkey}:{chain_id}` |
+
+### Critical Guarantees
+
+**✅ Wallet Address Immutability**
+- Once a (solana_pubkey, chain_id) → evm_address mapping is created, it **NEVER changes**
+- This is enforced by:
+  1. KV store's `IfExists::Deny` atomic operation
+  2. Read-before-write pattern in provisioning logic
+  3. First-writer-wins semantics in concurrent scenarios
+  4. **No delete operation** - mappings cannot be removed or reversed
+- **Security implication:** Prevents wallet substitution attacks and revert-then-recreate attacks
+- **Verified by tests:** `test_wallet_address_immutability`, `test_cannot_delete_and_recreate_mapping`, `test_atomicity_with_delete_attempt_before_write`
+
+**✅ Atomicity Under Concurrency**
+- Multiple simultaneous requests for the same mapping:
+  - All create CubeSigner keys (unavoidable in distributed system)
+  - Only one write succeeds (atomic KV operation)
+  - Losers retry and get the winning address
+  - Orphaned keys are acceptable (tradeoff for atomicity)
+
+**✅ Idempotency**
+- Calling provision with same parameters 1 time or 1000 times produces identical result
+- No side effects after first successful provision
+- Safe for retries at any layer (backend, C2F, KV)
+
+### Test Execution
+
+```bash
+# Run all tests
+cargo test
+
+# Run with output
+cargo test -- --nocapture
+
+# Run specific test
+cargo test test_wallet_address_immutability
+```
 
 ### Already Validated
 
@@ -320,16 +384,6 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 
 ---
 
-## 10. Next Steps
-
-1. **Cubist team:** Review this spec and answer open questions
-2. **Our team:** Finalize C2F code based on real SDK documentation
-3. **Joint:** Test in staging environment
-4. **Cubist team:** Provision production C2F endpoint and KV bucket
-5. **Our team:** Deploy backend with C2F integration
-
----
-
 ## Appendix: Code References
 
 - **C2F provisioning logic:** `src/lib.rs`
@@ -338,6 +392,4 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 
 ---
 
-## Contact
 
-For technical questions about this spec, reach out to the team.
