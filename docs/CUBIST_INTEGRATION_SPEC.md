@@ -359,6 +359,8 @@ cargo test test_wallet_address_immutability
 ```
 
 **Test Results:**
+<img width="984" height="603" alt="image" src="https://github.com/user-attachments/assets/35318094-c1a2-44a3-8211-b5b22eee3f6d" />
+
 
 ✅ **All 11 tests passing** - Atomicity, immutability, and concurrency guarantees validated
 
