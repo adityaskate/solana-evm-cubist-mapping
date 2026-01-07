@@ -17,8 +17,6 @@ use anyhow::{Result, anyhow};
 ///
 /// use cubist_c2f::keyvalue::{self, IfExists, Value};
 
-const MAPPING_BUCKET: &str = "solana_to_evm";
-
 #[derive(Deserialize, Clone)]
 pub struct ProvisionRequest {
     pub solana_pubkey: String,
@@ -34,10 +32,6 @@ pub struct ProvisionResponse {
 // Helpers
 // --------------------------------------------------
 
-fn kv_key(solana_pubkey: &str, chain_id: u64) -> String {
-    format!("{}:{}", solana_pubkey, chain_id)
-}
-
 /// Idempotent read:
 /// If a mapping already exists, return it.
 ///
@@ -48,8 +42,8 @@ fn get_existing_mapping(
 ) -> Result<Option<String>> {
     // Example real implementation (C2F):
     //
-    // let bucket = keyvalue::open(MAPPING_BUCKET)?;
-    // let key = kv_key(solana_pubkey, chain_id);
+    // let bucket = keyvalue::open("solana_to_evm")?;
+    // let key = format!("{}:{}", solana_pubkey, chain_id);
     //
     // match bucket.get(&key)? {
     //     Some(Value::String(addr)) => Ok(Some(addr)),
@@ -72,8 +66,8 @@ fn store_mapping_once(
 ) -> Result<()> {
     // Example real implementation (C2F):
     //
-    // let bucket = keyvalue::open(MAPPING_BUCKET)?;
-    // let key = kv_key(solana_pubkey, chain_id);
+    // let bucket = keyvalue::open("solana_to_evm")?;
+    // let key = format!("{}:{}", solana_pubkey, chain_id);
     //
     // bucket.set(
     //     &key,
