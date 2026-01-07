@@ -8,8 +8,10 @@ name = "cubist_wallet_provisioner"
 path = "src/lib.rs"
 
 [dependencies]
-# cubist-policy-sdk = { path = "./cubist-policy-sdk-main/sdk" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 anyhow = "1.0"
+
+# The actual Cubist policy is in the 'policy' subdirectory
+# Build it with: cd policy && cargo build --release
 

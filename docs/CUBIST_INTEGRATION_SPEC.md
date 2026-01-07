@@ -501,4 +501,160 @@ cargo test test_wallet_address_immutability
 
 ---
 
+## 10. Live Testing Flow (Production Validated ✅)
 
+The complete provisioning system has been tested on production CubeSigner. Below is the step-by-step flow with commands.
+
+### Step 1: Create EVM Key
+
+Create a Secp256k1 EVM key via CubeSigner CLI:
+
+```bash
+cs key create --key-type secp --metadata '{"name":"EVM_TestUser123"}'
+```
+
+**Output:**
+```json
+{
+  "keys": [{
+    "metadata": { "name": "EVM_TestUser123" },
+    "key_id": "Key#0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "key_type": "SecpEthAddr",
+    "material_id": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "purpose": "Evm"
+  }]
+}
+```
+
+![Step 1 Screenshot]
+
+---
+
+### Step 2: Store Mapping
+
+Invoke the policy to store mappings for multiple chains:
+
+```bash
+cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb5de2cf22b1693337f9ba6c36237" \
+  '{"action":"store","solana_pubkey":"TestUser123","chain_ids":[1,137,42161],"evm_address":"0xcb373e47d769b06dee02f05c86dd8790e0358aee"}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "evm_address": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+  "chain_mappings": {
+    "1": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "137": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "42161": "0xcb373e47d769b06dee02f05c86dd8790e0358aee"
+  }
+}
+```
+
+![Step 2 Screenshot]
+
+---
+
+### Step 3: Get Mappings
+
+Verify the stored mappings:
+
+```bash
+cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb5de2cf22b1693337f9ba6c36237" \
+  '{"action":"get","solana_pubkey":"TestUser123","chain_ids":[1,137,42161]}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "default_address": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+  "chain_mappings": {
+    "1": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "137": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "42161": "0xcb373e47d769b06dee02f05c86dd8790e0358aee"
+  }
+}
+```
+
+✅ All chains map to the same EVM address!
+
+![Step 3 Screenshot]
+
+---
+
+### Step 4: Create New EVM Key (for chain update)
+
+Create a new key specifically for updating chain 137:
+
+```bash
+cs key create --key-type secp --metadata '{"name":"EVM_7xKXtg_chain137"}'
+```
+
+**Output:**
+```json
+{
+  "keys": [{
+    "metadata": { "name": "EVM_7xKXtg_chain137" },
+    "key_id": "Key#0xb29db776e2f8e38dcb2da1ee6f92dd1208874424",
+    "key_type": "SecpEthAddr",
+    "material_id": "0xb29db776e2f8e38dcb2da1ee6f92dd1208874424",
+    "purpose": "Evm"
+  }]
+}
+```
+
+![Step 4 Screenshot]
+
+---
+
+### Step 5: Update Chain 137
+
+Update only chain 137 with the new EVM address:
+
+```bash
+cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb5de2cf22b1693337f9ba6c36237" \
+  '{"action":"update","solana_pubkey":"7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU","chain_id":137,"new_evm_address":"0xb29db776e2f8e38dcb2da1ee6f92dd1208874424"}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "new_evm_address": "0xb29db776e2f8e38dcb2da1ee6f92dd1208874424",
+  "chain_id": 137
+}
+```
+
+![Step 5 Screenshot]
+
+---
+
+### Step 6: Verify Update
+
+Confirm the update worked - chain 137 should have the new address:
+
+```bash
+cs policy invoke --name "skate_wallet_provisioner" --key-id "Key#0x7404906e09deb5de2cf22b1693337f9ba6c36237" \
+  '{"action":"get","solana_pubkey":"7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU","chain_ids":[1,137,42161]}'
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "default_address": "0x7404906e09deb5de2cf22b1693337f9ba6c36237",
+  "chain_mappings": {
+    "1": "0x7404906e09deb5de2cf22b1693337f9ba6c36237",
+    "137": "0xb29db776e2f8e38dcb2da1ee6f92dd1208874424",
+    "42161": "0x7404906e09deb5de2cf22b1693337f9ba6c36237"
+  }
+}
+```
+
+✅ **Chain 137 updated to `0xb29db...`, chains 1 and 42161 unchanged!**
+
+![Step 6 Screenshot]
+
+---

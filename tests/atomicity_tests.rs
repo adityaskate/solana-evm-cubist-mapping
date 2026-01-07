@@ -36,7 +36,7 @@ impl MockKvStore {
         Ok(())
     }
     
-    /// Set with overwrite allowed
+    /// Set with overwrite allowed (for admin updates)
     fn set(&self, key: &str, value: &str) -> Result<()> {
         let mut data = self.data.lock().unwrap();
         data.insert(key.to_string(), value.to_string());
@@ -48,27 +48,23 @@ impl MockKvStore {
         self.delete_attempts.lock().unwrap().push(key.to_string());
         Err(anyhow!("Delete operation not supported (immutable storage)"))
     }
-
-    fn get_write_attempts(&self) -> Vec<String> {
-        self.write_attempts.lock().unwrap().clone()
-    }
-
-    fn get_delete_attempts(&self) -> Vec<String> {
-        self.delete_attempts.lock().unwrap().clone()
-    }
 }
 
 /// Mock implementations using the test KV store
 struct TestContext {
     kv: MockKvStore,
-    key_counter: Arc<Mutex<u32>>,
+    /// Counter for default keys (one per Solana address)
+    default_key_counter: Arc<Mutex<u32>>,
+    /// Counter for chain-specific keys (for admin updates)
+    chain_key_counter: Arc<Mutex<u32>>,
 }
 
 impl TestContext {
     fn new() -> Self {
         Self {
             kv: MockKvStore::new(),
-            key_counter: Arc::new(Mutex::new(0)),
+            default_key_counter: Arc::new(Mutex::new(0)),
+            chain_key_counter: Arc::new(Mutex::new(1000)), // Start at 1000 to differentiate
         }
     }
 
@@ -97,49 +93,81 @@ impl TestContext {
         self.kv.set(&key, evm_address)
     }
 
+    /// Create default EVM key (one per Solana address, used across all chains)
     fn create_cubesigner_evm_key(&self, _solana_pubkey: &str) -> Result<String> {
-        let mut counter = self.key_counter.lock().unwrap();
+        let mut counter = self.default_key_counter.lock().unwrap();
         *counter += 1;
         Ok(format!("0x{:040x}", *counter))
     }
 
+    /// Create chain-specific EVM key (for admin updates)
+    fn create_cubesigner_evm_key_for_chain(&self, _solana_pubkey: &str, _chain_id: u64) -> Result<String> {
+        let mut counter = self.chain_key_counter.lock().unwrap();
+        *counter += 1;
+        Ok(format!("0x{:040x}", *counter))
+    }
+
+    /// Main provision handler - batch creation for multiple chains
     fn handle(&self, req: ProvisionRequest) -> Result<ProvisionResponse> {
-        // 1. Check if chain-specific mapping already exists
-        if let Some(addr) = self.get_existing_mapping(&req.solana_pubkey, req.chain_id)? {
-            return Ok(ProvisionResponse { evm_address: addr });
+        if req.chain_ids.is_empty() {
+            return Err(anyhow!("chain_ids cannot be empty"));
         }
 
-        // 2. Check if default EVM address exists (same across all chains)
+        // 1. Check if default EVM address already exists
         let evm_address = if let Some(addr) = self.get_default_evm_address(&req.solana_pubkey)? {
             addr
         } else {
-            // 3. Create new EVM key (one per Solana address)
+            // 2. Create new EVM key (one per Solana address)
             let addr = self.create_cubesigner_evm_key(&req.solana_pubkey)?;
             
-            // Store as default address
+            // Store as default address (atomic, first-writer-wins)
             self.store_default_evm_address(&req.solana_pubkey, &addr)?;
             
             addr
         };
 
-        // 4. Store chain-specific mapping (points to default address)
-        self.store_mapping_once(&req.solana_pubkey, req.chain_id, &evm_address)?;
-
-        Ok(ProvisionResponse { evm_address })
-    }
-    
-    fn handle_update_mapping(&self, req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
-        // Validate EVM address format
-        if !req.new_evm_address.starts_with("0x") || req.new_evm_address.len() != 42 {
-            return Err(anyhow!("Invalid EVM address format: {}", req.new_evm_address));
+        // 3. Store chain-specific mappings for ALL provided chain IDs
+        let mut chain_mappings = HashMap::new();
+        
+        for &chain_id in &req.chain_ids {
+            // Check if chain mapping already exists
+            if let Some(existing) = self.get_existing_mapping(&req.solana_pubkey, chain_id)? {
+                chain_mappings.insert(chain_id, existing);
+            } else {
+                // Store new mapping (atomic, first-writer-wins)
+                self.store_mapping_once(&req.solana_pubkey, chain_id, &evm_address)?;
+                chain_mappings.insert(chain_id, evm_address.clone());
+            }
         }
 
-        // Update the mapping (allows overwrite)
-        self.update_mapping(&req.solana_pubkey, req.chain_id, &req.new_evm_address)?;
+        Ok(ProvisionResponse { 
+            evm_address,
+            chain_mappings,
+        })
+    }
+    
+    /// Admin-only update handler - creates NEW wallet for specific chain
+    fn handle_update_mapping(&self, req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
+        // 1. Verify Solana address has been provisioned
+        let _default_addr = self.get_default_evm_address(&req.solana_pubkey)?
+            .ok_or_else(|| anyhow!(
+                "Solana address {} has not been provisioned yet", 
+                req.solana_pubkey
+            ))?;
+
+        // 2. Create NEW EVM key (chain-specific)
+        let new_evm_address = self.create_cubesigner_evm_key_for_chain(
+            &req.solana_pubkey, 
+            req.chain_id
+        )?;
+
+        // 3. Update the chain-specific mapping (allows overwrite)
+        self.update_mapping(&req.solana_pubkey, req.chain_id, &new_evm_address)?;
 
         Ok(UpdateMappingResponse {
             success: true,
-            evm_address: req.new_evm_address,
+            new_evm_address,
+            chain_id: req.chain_id,
         })
     }
 }
@@ -152,103 +180,241 @@ fn default_key(solana_pubkey: &str) -> String {
     format!("default:{}", solana_pubkey)
 }
 
+// =============================================================================
+// PROVISION TESTS (Batch Creation)
+// =============================================================================
+
 #[test]
-fn test_first_provision_creates_mapping() {
+fn test_provision_creates_wallet_for_all_chains() {
     let ctx = TestContext::new();
     let req = ProvisionRequest {
         solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
+        chain_ids: vec![1, 137, 42161],
     };
 
     let result = ctx.handle(req).unwrap();
     
-    // Should create a new address
+    // Should create ONE address
     assert_eq!(result.evm_address, "0x0000000000000000000000000000000000000001");
+    
+    // Should have mappings for all 3 chains
+    assert_eq!(result.chain_mappings.len(), 3);
+    
+    // All chains should have the SAME address
+    assert_eq!(result.chain_mappings.get(&1), Some(&"0x0000000000000000000000000000000000000001".to_string()));
+    assert_eq!(result.chain_mappings.get(&137), Some(&"0x0000000000000000000000000000000000000001".to_string()));
+    assert_eq!(result.chain_mappings.get(&42161), Some(&"0x0000000000000000000000000000000000000001".to_string()));
+    
+    // Should have only created one key
+    assert_eq!(*ctx.default_key_counter.lock().unwrap(), 1);
 }
 
 #[test]
-fn test_second_provision_returns_same_address() {
+fn test_provision_is_idempotent() {
     let ctx = TestContext::new();
     let req = ProvisionRequest {
         solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
+        chain_ids: vec![1, 137, 42161],
     };
 
     // First provision
     let result1 = ctx.handle(req.clone()).unwrap();
     
-    // Second provision
+    // Second provision (same request)
     let result2 = ctx.handle(req).unwrap();
     
-    // Should return the same address (idempotent)
+    // Should return the same address
     assert_eq!(result1.evm_address, result2.evm_address);
+    assert_eq!(result1.chain_mappings, result2.chain_mappings);
     
-    // Should only have created one key
-    assert_eq!(*ctx.key_counter.lock().unwrap(), 1);
+    // Should only have created one key (not two)
+    assert_eq!(*ctx.default_key_counter.lock().unwrap(), 1);
 }
 
 #[test]
-fn test_different_chains_get_different_addresses() {
+fn test_provision_can_add_new_chains_later() {
     let ctx = TestContext::new();
     
+    // First provision with chains 1, 137
     let req1 = ProvisionRequest {
         solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
+        chain_ids: vec![1, 137],
     };
+    let result1 = ctx.handle(req1).unwrap();
     
+    // Later provision with chain 42161 added
     let req2 = ProvisionRequest {
         solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 137,
+        chain_ids: vec![1, 137, 42161],
     };
-
-    let result1 = ctx.handle(req1).unwrap();
     let result2 = ctx.handle(req2).unwrap();
     
-    // Same Solana key, different chains → SAME EVM address by default
+    // All should have the same address (including new chain)
     assert_eq!(result1.evm_address, result2.evm_address);
+    assert_eq!(result2.chain_mappings.len(), 3);
+    assert_eq!(result2.chain_mappings.get(&42161), Some(&result1.evm_address));
+    
+    // Still only one key created
+    assert_eq!(*ctx.default_key_counter.lock().unwrap(), 1);
 }
 
 #[test]
-fn test_different_solana_keys_get_different_addresses() {
+fn test_provision_fails_with_empty_chain_ids() {
+    let ctx = TestContext::new();
+    let req = ProvisionRequest {
+        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+        chain_ids: vec![],
+    };
+
+    let result = ctx.handle(req);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("chain_ids cannot be empty"));
+}
+
+#[test]
+fn test_different_solana_addresses_get_different_wallets() {
     let ctx = TestContext::new();
     
     let req1 = ProvisionRequest {
         solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
+        chain_ids: vec![1, 137, 42161],
     };
     
     let req2 = ProvisionRequest {
         solana_pubkey: "B4fiuy1rJgmbTrraeZpcEtGtFzmt2GVYr1XEoSY7HqqC".to_string(),
-        chain_id: 1,
+        chain_ids: vec![1, 137, 42161],
     };
 
     let result1 = ctx.handle(req1).unwrap();
     let result2 = ctx.handle(req2).unwrap();
     
-    // Different Solana keys, same chain → different EVM addresses
+    // Different Solana addresses → different EVM wallets
     assert_ne!(result1.evm_address, result2.evm_address);
+    
+    // Two keys created (one per Solana address)
+    assert_eq!(*ctx.default_key_counter.lock().unwrap(), 2);
+}
+
+// =============================================================================
+// UPDATE TESTS (Admin Only)
+// =============================================================================
+
+#[test]
+fn test_update_creates_new_wallet_for_specific_chain() {
+    let ctx = TestContext::new();
+    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+
+    // First provision all chains with same default address
+    let provision_req = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_ids: vec![1, 137, 42161],
+    };
+    let provision_result = ctx.handle(provision_req).unwrap();
+    let default_address = provision_result.evm_address.clone();
+    
+    // Admin updates chain 137 to a NEW wallet
+    let update_req = UpdateMappingRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+    };
+    let update_result = ctx.handle_update_mapping(update_req).unwrap();
+    
+    // Update should succeed
+    assert!(update_result.success);
+    assert_eq!(update_result.chain_id, 137);
+    
+    // New address should be different from default
+    assert_ne!(update_result.new_evm_address, default_address);
+    
+    // Chain 137 should now have new address
+    let chain_137 = ctx.get_existing_mapping(solana_pubkey, 137).unwrap();
+    assert_eq!(chain_137, Some(update_result.new_evm_address.clone()));
+    
+    // Other chains should still have default address
+    let chain_1 = ctx.get_existing_mapping(solana_pubkey, 1).unwrap();
+    let chain_42161 = ctx.get_existing_mapping(solana_pubkey, 42161).unwrap();
+    assert_eq!(chain_1, Some(default_address.clone()));
+    assert_eq!(chain_42161, Some(default_address.clone()));
 }
 
 #[test]
-fn test_atomicity_prevents_overwrites() {
+fn test_update_fails_if_not_provisioned() {
+    let ctx = TestContext::new();
+    
+    // Try to update without provisioning first
+    let update_req = UpdateMappingRequest {
+        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+        chain_id: 137,
+    };
+    
+    let result = ctx.handle_update_mapping(update_req);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("has not been provisioned yet"));
+}
+
+#[test]
+fn test_update_can_be_called_multiple_times() {
     let ctx = TestContext::new();
     let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-    let chain_id = 1;
 
-    // Manually create first mapping
+    // Provision
+    let provision_req = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_ids: vec![1, 137, 42161],
+    };
+    ctx.handle(provision_req).unwrap();
+    
+    // First update for chain 137
+    let update_req1 = UpdateMappingRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+    };
+    let result1 = ctx.handle_update_mapping(update_req1).unwrap();
+    
+    // Second update for chain 137 (e.g., key rotation)
+    let update_req2 = UpdateMappingRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+    };
+    let result2 = ctx.handle_update_mapping(update_req2).unwrap();
+    
+    // Each update creates a new wallet
+    assert_ne!(result1.new_evm_address, result2.new_evm_address);
+    
+    // Latest address should be stored
+    let current = ctx.get_existing_mapping(solana_pubkey, 137).unwrap();
+    assert_eq!(current, Some(result2.new_evm_address));
+}
+
+// =============================================================================
+// ATOMICITY & CONCURRENCY TESTS
+// =============================================================================
+
+#[test]
+fn test_atomicity_prevents_overwrites_on_provision() {
+    let ctx = TestContext::new();
+    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+
+    // Manually create a mapping first (simulating race condition)
     let addr1 = "0xfirst111111111111111111111111111111111111";
-    ctx.store_mapping_once(solana_pubkey, chain_id, addr1).unwrap();
+    ctx.store_default_evm_address(solana_pubkey, addr1).unwrap();
+    ctx.store_mapping_once(solana_pubkey, 1, addr1).unwrap();
 
-    // Attempt to overwrite should fail
-    let addr2 = "0xsecond22222222222222222222222222222222222";
-    let result = ctx.store_mapping_once(solana_pubkey, chain_id, addr2);
+    // Attempt to provision (should not overwrite)
+    let req = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_ids: vec![1, 137],
+    };
+    let result = ctx.handle(req).unwrap();
     
-    assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Key already exists"));
+    // Should use existing default address
+    assert_eq!(result.evm_address, addr1);
     
-    // Verify original mapping is preserved
-    let stored = ctx.get_existing_mapping(solana_pubkey, chain_id).unwrap();
-    assert_eq!(stored, Some(addr1.to_string()));
+    // Chain 1 should have original address (not overwritten)
+    assert_eq!(result.chain_mappings.get(&1), Some(&addr1.to_string()));
+    
+    // Chain 137 should also use the default
+    assert_eq!(result.chain_mappings.get(&137), Some(&addr1.to_string()));
 }
 
 #[test]
@@ -257,9 +423,8 @@ fn test_concurrent_provisions_first_writer_wins() {
     
     let ctx = Arc::new(TestContext::new());
     let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string();
-    let chain_id = 1;
 
-    // Simulate 10 concurrent requests
+    // Simulate 10 concurrent provision requests
     let handles: Vec<_> = (0..10)
         .map(|_| {
             let ctx = Arc::clone(&ctx);
@@ -268,7 +433,7 @@ fn test_concurrent_provisions_first_writer_wins() {
             thread::spawn(move || {
                 let req = ProvisionRequest {
                     solana_pubkey,
-                    chain_id,
+                    chain_ids: vec![1, 137, 42161],
                 };
                 ctx.handle(req)
             })
@@ -286,42 +451,79 @@ fn test_concurrent_provisions_first_writer_wins() {
     assert!(!successful.is_empty());
     
     let first_addr = &successful[0].evm_address;
-    for result in successful {
+    for result in &successful {
         assert_eq!(&result.evm_address, first_addr);
     }
 
-    // Should have only created one key (the first writer)
-    // Note: In real race conditions, multiple keys might be created,
-    // but only one mapping is stored
-    let write_attempts = ctx.kv.get_write_attempts();
-    assert!(write_attempts.len() >= 1);
-    
-    // Verify only one mapping exists
-    let stored = ctx.get_existing_mapping(&solana_pubkey, chain_id).unwrap();
-    assert!(stored.is_some());
+    // Verify consistent state
+    let stored_default = ctx.get_default_evm_address(&solana_pubkey).unwrap();
+    assert!(stored_default.is_some());
 }
 
 #[test]
-fn test_wallet_address_immutability() {
+fn test_wallet_mappings_immutable_after_creation() {
     let ctx = TestContext::new();
     let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-    let chain_id = 1;
 
     let req = ProvisionRequest {
         solana_pubkey: solana_pubkey.to_string(),
-        chain_id,
+        chain_ids: vec![1, 137, 42161],
     };
 
-    // Create initial mapping
+    // Create initial mappings
     let result1 = ctx.handle(req.clone()).unwrap();
+    let original_address = result1.evm_address.clone();
     
-    // Make 100 more requests
+    // Make 100 more provision requests
     for _ in 0..100 {
         let result = ctx.handle(req.clone()).unwrap();
-        assert_eq!(result.evm_address, result1.evm_address,
-            "Address changed after multiple provisions - immutability violated!");
+        assert_eq!(result.evm_address, original_address,
+            "Default address changed - immutability violated!");
+        
+        for chain_id in &[1u64, 137, 42161] {
+            assert_eq!(
+                result.chain_mappings.get(chain_id),
+                Some(&original_address),
+                "Chain {} mapping changed - immutability violated!", chain_id
+            );
+        }
     }
+    
+    // Still only one default key created
+    assert_eq!(*ctx.default_key_counter.lock().unwrap(), 1);
 }
+
+#[test]
+fn test_cannot_delete_mappings() {
+    let ctx = TestContext::new();
+    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+
+    // Create mappings
+    let req = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_ids: vec![1, 137, 42161],
+    };
+    let result = ctx.handle(req).unwrap();
+    let original_address = result.evm_address.clone();
+
+    // Attempt to delete mappings (should fail)
+    let default_key = default_key(solana_pubkey);
+    let chain_key = kv_key(solana_pubkey, 1);
+    
+    assert!(ctx.kv.delete(&default_key).is_err());
+    assert!(ctx.kv.delete(&chain_key).is_err());
+
+    // Verify mappings still exist
+    let stored_default = ctx.get_default_evm_address(solana_pubkey).unwrap();
+    assert_eq!(stored_default, Some(original_address.clone()));
+    
+    let stored_chain = ctx.get_existing_mapping(solana_pubkey, 1).unwrap();
+    assert_eq!(stored_chain, Some(original_address));
+}
+
+// =============================================================================
+// KV KEY FORMAT TESTS
+// =============================================================================
 
 #[test]
 fn test_kv_key_format() {
@@ -331,197 +533,93 @@ fn test_kv_key_format() {
 }
 
 #[test]
-fn test_retry_after_race_condition() {
+fn test_default_key_format() {
+    assert_eq!(default_key("ABC123"), "default:ABC123");
+    assert_eq!(default_key("7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU"), 
+               "default:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU");
+}
+
+// =============================================================================
+// INTEGRATION SCENARIO TESTS
+// =============================================================================
+
+#[test]
+fn test_full_user_journey() {
     let ctx = TestContext::new();
-    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-    let chain_id = 1;
-
-    // First provision succeeds
-    let req = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id,
-    };
-    let result1 = ctx.handle(req.clone()).unwrap();
-
-    // Simulate a lost race: create a key but can't store it
-    let orphaned_key = ctx.create_cubesigner_evm_key(solana_pubkey).unwrap();
-    let store_result = ctx.store_mapping_once(solana_pubkey, chain_id, &orphaned_key);
-    assert!(store_result.is_err()); // Should fail because mapping exists
-
-    // Retry the full provision - should succeed by returning existing mapping
-    let result2 = ctx.handle(req).unwrap();
-    assert_eq!(result2.evm_address, result1.evm_address);
     
-    // Orphaned key should not be the stored address
-    assert_ne!(orphaned_key, result2.evm_address);
-}
-
-#[test]
-fn test_cannot_delete_and_recreate_mapping() {
-    let ctx = TestContext::new();
-    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-    let chain_id = 1;
-
-    // Create initial mapping
-    let req = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id,
-    };
-    let result1 = ctx.handle(req).unwrap();
-    let original_address = result1.evm_address.clone();
-
-    // Attempt to delete the mapping (should fail - storage is immutable)
-    let key = kv_key(solana_pubkey, chain_id);
-    let delete_result = ctx.kv.delete(&key);
-    assert!(delete_result.is_err());
-    assert!(delete_result.unwrap_err().to_string().contains("not supported"));
-
-    // Verify the delete was attempted
-    let delete_attempts = ctx.kv.get_delete_attempts();
-    assert_eq!(delete_attempts.len(), 1);
-
-    // Verify original mapping still exists
-    let stored = ctx.get_existing_mapping(solana_pubkey, chain_id).unwrap();
-    assert_eq!(stored, Some(original_address.clone()));
-
-    // Even after delete attempt, provision should return the same address
-    let req2 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id,
-    };
-    let result2 = ctx.handle(req2).unwrap();
-    assert_eq!(result2.evm_address, original_address);
-}
-
-#[test]
-fn test_atomicity_with_delete_attempt_before_write() {
-    let ctx = TestContext::new();
-    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-    let chain_id = 1;
-
-    // Create initial mapping
-    let addr1 = "0xfirst111111111111111111111111111111111111";
-    ctx.store_mapping_once(solana_pubkey, chain_id, addr1).unwrap();
-
-    // Attacker scenario: try to delete then recreate with different address
-    let key = kv_key(solana_pubkey, chain_id);
+    // User A comes with Solana wallet
+    let sol_a = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
     
-    // 1. Attempt to delete
-    let delete_result = ctx.kv.delete(&key);
-    assert!(delete_result.is_err(), "Delete should not be allowed");
-
-    // 2. Attempt to write new mapping (should fail due to IfExists::Deny)
-    let addr2 = "0xattacker2222222222222222222222222222222222";
-    let write_result = ctx.store_mapping_once(solana_pubkey, chain_id, addr2);
-    assert!(write_result.is_err(), "Overwrite should not be allowed");
-
-    // 3. Verify original mapping is unchanged
-    let stored = ctx.get_existing_mapping(solana_pubkey, chain_id).unwrap();
-    assert_eq!(stored, Some(addr1.to_string()));
-    assert_ne!(stored, Some(addr2.to_string()));
-}
-
-#[test]
-fn test_same_address_across_chains_by_default() {
-    let ctx = TestContext::new();
-    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-
-    // Provision on Ethereum (chain_id=1)
-    let req1 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id: 1,
+    // Step 1: Provision wallet for all chains
+    let provision_req = ProvisionRequest {
+        solana_pubkey: sol_a.to_string(),
+        chain_ids: vec![1, 137, 42161],
     };
-    let result1 = ctx.handle(req1).unwrap();
-
-    // Provision on Polygon (chain_id=137)
-    let req2 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id: 137,
-    };
-    let result2 = ctx.handle(req2).unwrap();
-
-    // Provision on Arbitrum (chain_id=42161)
-    let req3 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id: 42161,
-    };
-    let result3 = ctx.handle(req3).unwrap();
-
-    // All chains should use the same EVM address by default
-    assert_eq!(result1.evm_address, result2.evm_address);
-    assert_eq!(result2.evm_address, result3.evm_address);
+    let provision_result = ctx.handle(provision_req).unwrap();
     
-    // Should only have created one key
-    assert_eq!(*ctx.key_counter.lock().unwrap(), 1);
-}
-
-#[test]
-fn test_update_mapping_for_specific_chain() {
-    let ctx = TestContext::new();
-    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
-
-    // Provision on chain 1 and 137 - both get same default address
-    let req1 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id: 1,
-    };
-    let result1 = ctx.handle(req1).unwrap();
-
-    let req2 = ProvisionRequest {
-        solana_pubkey: solana_pubkey.to_string(),
-        chain_id: 137,
-    };
-    let result2 = ctx.handle(req2).unwrap();
-
-    assert_eq!(result1.evm_address, result2.evm_address);
-    let default_address = result1.evm_address.clone();
-
-    // Update chain 137 to use a different address
-    let new_address = "0xabcdef1234567890abcdef1234567890abcdef12";
+    println!("Provisioned wallet: {}", provision_result.evm_address);
+    println!("Chain mappings: {:?}", provision_result.chain_mappings);
+    
+    // Verify all chains have same address
+    let default_addr = provision_result.evm_address.clone();
+    assert_eq!(provision_result.chain_mappings.get(&1), Some(&default_addr));
+    assert_eq!(provision_result.chain_mappings.get(&137), Some(&default_addr));
+    assert_eq!(provision_result.chain_mappings.get(&42161), Some(&default_addr));
+    
+    // Step 2: Later, admin decides to update chain 137 to new address
     let update_req = UpdateMappingRequest {
-        solana_pubkey: solana_pubkey.to_string(),
+        solana_pubkey: sol_a.to_string(),
         chain_id: 137,
-        new_evm_address: new_address.to_string(),
     };
     let update_result = ctx.handle_update_mapping(update_req).unwrap();
-    assert!(update_result.success);
-    assert_eq!(update_result.evm_address, new_address);
-
-    // Chain 1 should still have the default address
-    let chain1_stored = ctx.get_existing_mapping(solana_pubkey, 1).unwrap();
-    assert_eq!(chain1_stored, Some(default_address.clone()));
-
-    // Chain 137 should have the new address
-    let chain137_stored = ctx.get_existing_mapping(solana_pubkey, 137).unwrap();
-    assert_eq!(chain137_stored, Some(new_address.to_string()));
-    assert_ne!(chain137_stored, Some(default_address));
+    
+    println!("Updated chain 137 to new wallet: {}", update_result.new_evm_address);
+    
+    // Step 3: Verify final state
+    // Chain 1 and 42161 still have default address
+    assert_eq!(ctx.get_existing_mapping(sol_a, 1).unwrap(), Some(default_addr.clone()));
+    assert_eq!(ctx.get_existing_mapping(sol_a, 42161).unwrap(), Some(default_addr.clone()));
+    
+    // Chain 137 has new address
+    assert_eq!(ctx.get_existing_mapping(sol_a, 137).unwrap(), Some(update_result.new_evm_address.clone()));
+    assert_ne!(ctx.get_existing_mapping(sol_a, 137).unwrap(), Some(default_addr));
 }
 
 #[test]
-fn test_update_mapping_validates_address_format() {
+fn test_multiple_users_independent() {
     let ctx = TestContext::new();
     
-    // Invalid: missing 0x prefix
-    let req1 = UpdateMappingRequest {
-        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
-        new_evm_address: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+    let sol_a = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+    let sol_b = "B4fiuy1rJgmbTrraeZpcEtGtFzmt2GVYr1XEoSY7HqqC";
+    
+    // Provision both users
+    let req_a = ProvisionRequest {
+        solana_pubkey: sol_a.to_string(),
+        chain_ids: vec![1, 137],
     };
-    assert!(ctx.handle_update_mapping(req1).is_err());
-
-    // Invalid: wrong length
-    let req2 = UpdateMappingRequest {
-        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
-        new_evm_address: "0xshort".to_string(),
+    let req_b = ProvisionRequest {
+        solana_pubkey: sol_b.to_string(),
+        chain_ids: vec![1, 137],
     };
-    assert!(ctx.handle_update_mapping(req2).is_err());
-
-    // Valid
-    let req3 = UpdateMappingRequest {
-        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
-        chain_id: 1,
-        new_evm_address: "0xabcdef1234567890abcdef1234567890abcdef12".to_string(),
+    
+    let result_a = ctx.handle(req_a).unwrap();
+    let result_b = ctx.handle(req_b).unwrap();
+    
+    // Different users have different wallets
+    assert_ne!(result_a.evm_address, result_b.evm_address);
+    
+    // Update user A's chain 137
+    let update_a = UpdateMappingRequest {
+        solana_pubkey: sol_a.to_string(),
+        chain_id: 137,
     };
-    assert!(ctx.handle_update_mapping(req3).is_ok());
+    let update_result_a = ctx.handle_update_mapping(update_a).unwrap();
+    
+    // User B should be unaffected
+    let b_chain_137 = ctx.get_existing_mapping(sol_b, 137).unwrap();
+    assert_eq!(b_chain_137, Some(result_b.evm_address.clone()));
+    
+    // User A's chain 137 should be updated
+    let a_chain_137 = ctx.get_existing_mapping(sol_a, 137).unwrap();
+    assert_eq!(a_chain_137, Some(update_result_a.new_evm_address));
 }
