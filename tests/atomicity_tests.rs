@@ -1,4 +1,4 @@
-use cubist_wallet_provisioner::{ProvisionRequest, ProvisionResponse};
+use cubist_wallet_provisioner::{ProvisionRequest, ProvisionResponse, UpdateMappingRequest, UpdateMappingResponse};
 use anyhow::{Result, anyhow};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -32,6 +32,13 @@ impl MockKvStore {
         if data.contains_key(key) {
             return Err(anyhow!("Key already exists (IfExists::Deny failed)"));
         }
+        data.insert(key.to_string(), value.to_string());
+        Ok(())
+    }
+    
+    /// Set with overwrite allowed
+    fn set(&self, key: &str, value: &str) -> Result<()> {
+        let mut data = self.data.lock().unwrap();
         data.insert(key.to_string(), value.to_string());
         Ok(())
     }
@@ -69,36 +76,80 @@ impl TestContext {
         let key = kv_key(solana_pubkey, chain_id);
         Ok(self.kv.get(&key))
     }
+    
+    fn get_default_evm_address(&self, solana_pubkey: &str) -> Result<Option<String>> {
+        let key = default_key(solana_pubkey);
+        Ok(self.kv.get(&key))
+    }
 
     fn store_mapping_once(&self, solana_pubkey: &str, chain_id: u64, evm_address: &str) -> Result<()> {
         let key = kv_key(solana_pubkey, chain_id);
         self.kv.set_if_not_exists(&key, evm_address)
     }
+    
+    fn store_default_evm_address(&self, solana_pubkey: &str, evm_address: &str) -> Result<()> {
+        let key = default_key(solana_pubkey);
+        self.kv.set_if_not_exists(&key, evm_address)
+    }
+    
+    fn update_mapping(&self, solana_pubkey: &str, chain_id: u64, evm_address: &str) -> Result<()> {
+        let key = kv_key(solana_pubkey, chain_id);
+        self.kv.set(&key, evm_address)
+    }
 
-    fn create_cubesigner_evm_key(&self, _solana_pubkey: &str, _chain_id: u64) -> Result<String> {
+    fn create_cubesigner_evm_key(&self, _solana_pubkey: &str) -> Result<String> {
         let mut counter = self.key_counter.lock().unwrap();
         *counter += 1;
         Ok(format!("0x{:040x}", *counter))
     }
 
     fn handle(&self, req: ProvisionRequest) -> Result<ProvisionResponse> {
-        // 1. Check if mapping already exists
+        // 1. Check if chain-specific mapping already exists
         if let Some(addr) = self.get_existing_mapping(&req.solana_pubkey, req.chain_id)? {
             return Ok(ProvisionResponse { evm_address: addr });
         }
 
-        // 2. Create new EVM wallet
-        let evm_address = self.create_cubesigner_evm_key(&req.solana_pubkey, req.chain_id)?;
+        // 2. Check if default EVM address exists (same across all chains)
+        let evm_address = if let Some(addr) = self.get_default_evm_address(&req.solana_pubkey)? {
+            addr
+        } else {
+            // 3. Create new EVM key (one per Solana address)
+            let addr = self.create_cubesigner_evm_key(&req.solana_pubkey)?;
+            
+            // Store as default address
+            self.store_default_evm_address(&req.solana_pubkey, &addr)?;
+            
+            addr
+        };
 
-        // 3. Store mapping atomically (first writer wins)
+        // 4. Store chain-specific mapping (points to default address)
         self.store_mapping_once(&req.solana_pubkey, req.chain_id, &evm_address)?;
 
         Ok(ProvisionResponse { evm_address })
+    }
+    
+    fn handle_update_mapping(&self, req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
+        // Validate EVM address format
+        if !req.new_evm_address.starts_with("0x") || req.new_evm_address.len() != 42 {
+            return Err(anyhow!("Invalid EVM address format: {}", req.new_evm_address));
+        }
+
+        // Update the mapping (allows overwrite)
+        self.update_mapping(&req.solana_pubkey, req.chain_id, &req.new_evm_address)?;
+
+        Ok(UpdateMappingResponse {
+            success: true,
+            evm_address: req.new_evm_address,
+        })
     }
 }
 
 fn kv_key(solana_pubkey: &str, chain_id: u64) -> String {
     format!("{}:{}", solana_pubkey, chain_id)
+}
+
+fn default_key(solana_pubkey: &str) -> String {
+    format!("default:{}", solana_pubkey)
 }
 
 #[test]
@@ -153,8 +204,8 @@ fn test_different_chains_get_different_addresses() {
     let result1 = ctx.handle(req1).unwrap();
     let result2 = ctx.handle(req2).unwrap();
     
-    // Same Solana key, different chains → different EVM addresses
-    assert_ne!(result1.evm_address, result2.evm_address);
+    // Same Solana key, different chains → SAME EVM address by default
+    assert_eq!(result1.evm_address, result2.evm_address);
 }
 
 #[test]
@@ -293,7 +344,7 @@ fn test_retry_after_race_condition() {
     let result1 = ctx.handle(req.clone()).unwrap();
 
     // Simulate a lost race: create a key but can't store it
-    let orphaned_key = ctx.create_cubesigner_evm_key(solana_pubkey, chain_id).unwrap();
+    let orphaned_key = ctx.create_cubesigner_evm_key(solana_pubkey).unwrap();
     let store_result = ctx.store_mapping_once(solana_pubkey, chain_id, &orphaned_key);
     assert!(store_result.is_err()); // Should fail because mapping exists
 
@@ -368,4 +419,109 @@ fn test_atomicity_with_delete_attempt_before_write() {
     let stored = ctx.get_existing_mapping(solana_pubkey, chain_id).unwrap();
     assert_eq!(stored, Some(addr1.to_string()));
     assert_ne!(stored, Some(addr2.to_string()));
+}
+
+#[test]
+fn test_same_address_across_chains_by_default() {
+    let ctx = TestContext::new();
+    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+
+    // Provision on Ethereum (chain_id=1)
+    let req1 = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 1,
+    };
+    let result1 = ctx.handle(req1).unwrap();
+
+    // Provision on Polygon (chain_id=137)
+    let req2 = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+    };
+    let result2 = ctx.handle(req2).unwrap();
+
+    // Provision on Arbitrum (chain_id=42161)
+    let req3 = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 42161,
+    };
+    let result3 = ctx.handle(req3).unwrap();
+
+    // All chains should use the same EVM address by default
+    assert_eq!(result1.evm_address, result2.evm_address);
+    assert_eq!(result2.evm_address, result3.evm_address);
+    
+    // Should only have created one key
+    assert_eq!(*ctx.key_counter.lock().unwrap(), 1);
+}
+
+#[test]
+fn test_update_mapping_for_specific_chain() {
+    let ctx = TestContext::new();
+    let solana_pubkey = "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU";
+
+    // Provision on chain 1 and 137 - both get same default address
+    let req1 = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 1,
+    };
+    let result1 = ctx.handle(req1).unwrap();
+
+    let req2 = ProvisionRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+    };
+    let result2 = ctx.handle(req2).unwrap();
+
+    assert_eq!(result1.evm_address, result2.evm_address);
+    let default_address = result1.evm_address.clone();
+
+    // Update chain 137 to use a different address
+    let new_address = "0xabcdef1234567890abcdef1234567890abcdef12";
+    let update_req = UpdateMappingRequest {
+        solana_pubkey: solana_pubkey.to_string(),
+        chain_id: 137,
+        new_evm_address: new_address.to_string(),
+    };
+    let update_result = ctx.handle_update_mapping(update_req).unwrap();
+    assert!(update_result.success);
+    assert_eq!(update_result.evm_address, new_address);
+
+    // Chain 1 should still have the default address
+    let chain1_stored = ctx.get_existing_mapping(solana_pubkey, 1).unwrap();
+    assert_eq!(chain1_stored, Some(default_address.clone()));
+
+    // Chain 137 should have the new address
+    let chain137_stored = ctx.get_existing_mapping(solana_pubkey, 137).unwrap();
+    assert_eq!(chain137_stored, Some(new_address.to_string()));
+    assert_ne!(chain137_stored, Some(default_address));
+}
+
+#[test]
+fn test_update_mapping_validates_address_format() {
+    let ctx = TestContext::new();
+    
+    // Invalid: missing 0x prefix
+    let req1 = UpdateMappingRequest {
+        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+        chain_id: 1,
+        new_evm_address: "abcdef1234567890abcdef1234567890abcdef12".to_string(),
+    };
+    assert!(ctx.handle_update_mapping(req1).is_err());
+
+    // Invalid: wrong length
+    let req2 = UpdateMappingRequest {
+        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+        chain_id: 1,
+        new_evm_address: "0xshort".to_string(),
+    };
+    assert!(ctx.handle_update_mapping(req2).is_err());
+
+    // Valid
+    let req3 = UpdateMappingRequest {
+        solana_pubkey: "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU".to_string(),
+        chain_id: 1,
+        new_evm_address: "0xabcdef1234567890abcdef1234567890abcdef12".to_string(),
+    };
+    assert!(ctx.handle_update_mapping(req3).is_ok());
 }

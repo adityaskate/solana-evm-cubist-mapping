@@ -9,12 +9,16 @@
 ## System Overview
 
 We're building a **deterministic Solana → EVM wallet provisioning system** where:
-- One Solana wallet maps to exactly one EVM wallet per chain (immutable)
+- **By default:** One Solana wallet maps to the same EVM address across all chains
+- **Optionally:** Can override the default EVM address for specific chains
 - Backend authenticates users via Solana signature verification
 - C2F function handles wallet provisioning (KV lookup + CubeSigner key creation)
 - All state is stored in Cubist KV
 
-**Key requirement:** Idempotent, atomic, first-writer-wins semantics.
+**Key requirements:** 
+- Idempotent, atomic provisioning
+- Same EVM address across chains by default (reduces key management complexity)
+- Ability to update mappings for specific chains when needed
 
 ---
 
@@ -29,13 +33,14 @@ Bucket name: solana_to_evm
 ### Key Schema
 
 ```
-{solana_pubkey}:{chain_id} → {evm_address}
+default:{solana_pubkey} → {evm_address}              # Default address used across all chains
+{solana_pubkey}:{chain_id} → {evm_address}           # Chain-specific override (optional)
 ```
 
 **Examples:**
 ```
-7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU:1   → 0xabc...def
-7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU:137 → 0x123...456
+default:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU → 0xabc...def  # Used for all chains by default
+7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU:137 → 0x123...456    # Polygon-specific override
 ```
 
 ### Required Operations
@@ -44,14 +49,16 @@ Bucket name: solana_to_evm
 |-----------|---------------|---------|
 | **Open bucket** | `keyvalue::open("solana_to_evm")` | Get bucket handle |
 | **Read** | `bucket.get(key)` → `Option<Value>` | Idempotent lookup |
-| **Atomic write** | `bucket.set(key, value, IfExists::Deny)` | First-writer-wins |
+| **Atomic write** | `bucket.set(key, value, IfExists::Deny)` | First-writer-wins for defaults |
+| **Update** | `bucket.set(key, value, IfExists::Allow)` | Update chain-specific mapping |
 
 ### Critical Requirements
 
 1. **Atomicity:** `IfExists::Deny` must be atomic (prevent race conditions)
-2. **Immutability:** Once written, a key-value pair never changes
-3. **Consistency:** All C2F instances must see the same KV state
-4. **Error handling:** Clear error when `IfExists::Deny` fails (key exists)
+2. **Default Immutability:** Once a default address is created, it should not change
+3. **Chain Override Flexibility:** Individual chain mappings can be updated
+4. **Consistency:** All C2F instances must see the same KV state
+5. **Error handling:** Clear error when `IfExists::Deny` fails (key exists)
 
 ### Questions for Cubist
 
@@ -73,10 +80,9 @@ We create **Secp256k1 EVM keys** dynamically using CubeSigner CLI.
 ```rust
 fn create_cubesigner_evm_key(
     solana_pubkey: &str,
-    chain_id: u64,
 ) -> Result<String> {
-    // Generate unique key material ID
-    let key_material_id = format!("EVM_{}_{}", solana_pubkey, chain_id);
+    // Generate unique key material ID (one per Solana address, not per chain)
+    let key_material_id = format!("EVM_{}", solana_pubkey);
     
     // Create key via CLI
     cs key create \
@@ -90,19 +96,16 @@ fn create_cubesigner_evm_key(
 #### Key Material ID Format
 
 ```
-EVM_{solana_pubkey}_{chain_id}
+EVM_{solana_pubkey}
 ```
 
 **Examples:**
 ```
-EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU_1
-EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU_137
+EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
+EVM_B4fiuy1rJgmbTrraeZpcEtGtFzmt2GVYr1XEoSY7HqqC
 ```
 
-This ensures:
-- Deterministic key IDs for tracking
-- Easy lookup of which Solana wallet maps to which EVM key
-- Unique keys per (solana_pubkey, chain_id) combination
+**Note:** One EVM key is created per Solana address (chain-agnostic). This key is used across all EVM chains by default, simplifying key management.
 
 #### Key Lifecycle
 
@@ -170,7 +173,9 @@ tx.signatures[0] = Buffer.from(sigBase64, "base64");
 
 ## 4. C2F Function Specification
 
-### Input
+### Provision Function
+
+#### Input
 
 ```json
 {
@@ -179,7 +184,7 @@ tx.signatures[0] = Buffer.from(sigBase64, "base64");
 }
 ```
 
-### Output (success)
+#### Output (success)
 
 ```json
 {
@@ -187,43 +192,104 @@ tx.signatures[0] = Buffer.from(sigBase64, "base64");
 }
 ```
 
-### Output (error)
-
-```json
-{
-  "error": "KV write conflict" | "CubeSigner key creation failed" | ...
-}
-```
-
-### Logic Flow
+#### Logic Flow
 
 ```rust
 pub fn handle(req: ProvisionRequest) -> Result<ProvisionResponse> {
-    // 1. Idempotent read
+    // 1. Check if chain-specific mapping exists → return it
     if let Some(addr) = get_existing_mapping(&req.solana_pubkey, req.chain_id)? {
         return Ok(ProvisionResponse { evm_address: addr });
     }
 
-    // 2. Create new EVM key via CubeSigner
-    let evm_address = create_cubesigner_evm_key(&req.solana_pubkey, req.chain_id)?;
+    // 2. Check if default EVM address exists (same across all chains)
+    let evm_address = if let Some(addr) = get_default_evm_address(&req.solana_pubkey)? {
+        addr
+    } else {
+        // 3. Create new EVM key (one per Solana address)
+        let addr = create_cubesigner_evm_key(&req.solana_pubkey)?;
+        
+        // Store as default address
+        store_default_evm_address(&req.solana_pubkey, &addr)?;
+        
+        addr
+    };
 
-    // 3. Atomic store (first-writer-wins)
+    // 4. Store chain-specific mapping (points to default address)
     store_mapping_once(&req.solana_pubkey, req.chain_id, &evm_address)?;
 
     Ok(ProvisionResponse { evm_address })
 }
 ```
 
+**Behavior:**
+- First provision for any chain creates one EVM key
+- Subsequent provisions for other chains reuse the same EVM address
+- Idempotent: calling multiple times returns the same address
+
+---
+
+### Update Mapping Function
+
+#### Input
+
+```json
+{
+  "solana_pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "chain_id": 137,
+  "new_evm_address": "0x1234567890abcdef1234567890abcdef12345678"
+}
+```
+
+#### Output (success)
+
+```json
+{
+  "success": true,
+  "evm_address": "0x1234567890abcdef1234567890abcdef12345678"
+}
+```
+
+#### Logic Flow
+
+```rust
+pub fn handle_update_mapping(req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
+    // Validate EVM address format
+    if !req.new_evm_address.starts_with("0x") || req.new_evm_address.len() != 42 {
+        return Err(anyhow!("Invalid EVM address format"));
+    }
+
+    // Update the mapping (allows overwrite)
+    update_mapping(&req.solana_pubkey, req.chain_id, &req.new_evm_address)?;
+
+    Ok(UpdateMappingResponse {
+        success: true,
+        evm_address: req.new_evm_address,
+    })
+}
+```
+
+**Use Case:** Override the default EVM address for a specific chain (e.g., use a different address on Polygon while keeping the same address on Ethereum and Arbitrum)
+
+---
+
+### Output (error)
+
+```json
+{
+  "error": "KV write conflict" | "CubeSigner key creation failed" | "Invalid EVM address format" | ...
+}
+```
+
 ### Concurrency Handling
 
-If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
-1. Both read KV (both get `None`)
+If two requests for the same `solana_pubkey` arrive simultaneously (different or same chains):
+1. Both read default address (both get `None`)
 2. Both create a CubeSigner key
-3. Both attempt atomic write with `IfExists::Deny`
+3. Both attempt atomic write with `IfExists::Deny` on default address
 4. **First writer wins**, second gets error
-5. Second retries, reads existing mapping, returns it
+5. Second retries, reads existing default address, uses it
 
-**We accept that one CubeSigner key may be orphaned.** This is acceptable.
+**We accept that one CubeSigner key may be orphaned.** This is acceptable and happens rarely.
 
 ---
 
@@ -241,10 +307,13 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 | Scenario | Expected Behavior |
 |----------|-------------------|
 | Idempotent request (mapping exists) | Return cached address (200 OK) |
-| First request for mapping | Create key, store, return (200 OK) |
+| First request for Solana address | Create key, store default, return (200 OK) |
+| Request for new chain (default exists) | Reuse default address, return (200 OK) |
+| Update mapping | Override chain-specific mapping, return (200 OK) |
 | Concurrent requests (race) | First wins, second retries and succeeds (200 OK) |
 | CubeSigner API failure | Return error (500), client should retry |
 | KV unavailable | Return error (503), client should retry |
+| Invalid EVM address in update | Return error (400), client fixes input |
 
 ---
 
@@ -277,12 +346,12 @@ If two requests for the same `(solana_pubkey, chain_id)` arrive simultaneously:
 - C2F is the only component with CubeSigner access
 - KV is only accessible from C2F (not from public internet)
 
-### Key Immutability
+### Key Immutability & Flexibility
 
-- Once a mapping is created, it cannot be changed
-- Prevents wallet substitution attacks
+- Once a default EVM address is created for a Solana pubkey, it remains the default
+- Chain-specific mappings can be updated to override the default
 - Lost Solana key = lost access to provisioned EVM wallets (by design)
-- **Verified by tests:** `test_wallet_address_immutability`, `test_atomicity_prevents_overwrites`
+- **Verified by tests:** `test_wallet_address_immutability`, `test_atomicity_prevents_overwrites`, `test_same_address_across_chains_by_default`, `test_update_mapping_for_specific_chain`
 
 ### Race Condition Handling
 
@@ -311,24 +380,43 @@ Comprehensive tests validate the following critical properties:
 | `test_concurrent_provisions_first_writer_wins` | Concurrent requests for the same mapping result in one winner, all get same address |
 | `test_retry_after_race_condition` | Lost race conditions (orphaned keys) are handled correctly on retry |
 
+#### **Default Address Behavior Tests**
+
+| Test | Behavior Validated |
+|------|-------------------|
+| `test_same_address_across_chains_by_default` | Same Solana key provisioned on multiple chains gets the same EVM address |
+| `test_update_mapping_for_specific_chain` | Can override default address for specific chains |
+| `test_update_mapping_validates_address_format` | Update function validates EVM address format |
+
 #### **Functional Tests**
 
 | Test | Behavior Validated |
 |------|-------------------|
 | `test_first_provision_creates_mapping` | Initial provision creates new EVM address |
 | `test_second_provision_returns_same_address` | Idempotent behavior - repeated calls return cached address |
-| `test_different_chains_get_different_addresses` | Same Solana key on different chains → different EVM addresses |
+| `test_different_chains_get_different_addresses` | Same Solana key can have different addresses if updated per chain |
 | `test_different_solana_keys_get_different_addresses` | Different Solana keys → different EVM addresses |
-| `test_kv_key_format` | KV key format is `{solana_pubkey}:{chain_id}` |
+| `test_kv_key_format` | KV key format is correct |
 
 ### Critical Guarantees
 
-**✅ Wallet Address Immutability**
-- Once a (solana_pubkey, chain_id) → evm_address mapping is created, it **NEVER changes**
+**✅ Default Address Consistency**
+- One Solana address → one default EVM address (used across all chains)
+- Simplifies key management and reduces CubeSigner key count
+- Default address cannot be changed once created
+
+**✅ Chain-Specific Flexibility**
+- Individual chain mappings can be updated to override the default
+- Useful for special cases (e.g., using a different address on one chain)
+- Updates are atomic and validated
+
+**✅ Wallet Address Behavior**
+- By default: Same EVM address across all chains
+- With updates: Can customize per chain
 - This is enforced by:
-  1. KV store's `IfExists::Deny` atomic operation
-  2. Read-before-write pattern in provisioning logic
-  3. First-writer-wins semantics in concurrent scenarios
+  1. KV store's atomic operations
+  2. Separate default and chain-specific keys
+  3. Update function with validation
   4. **No delete operation** - mappings cannot be removed or reversed
 - **Security implication:** Prevents wallet substitution attacks and revert-then-recreate attacks
 - **Verified by tests:** `test_wallet_address_immutability`, `test_cannot_delete_and_recreate_mapping`, `test_atomicity_with_delete_attempt_before_write`
@@ -362,7 +450,7 @@ cargo test test_wallet_address_immutability
 <img width="984" height="603" alt="image" src="https://github.com/user-attachments/assets/35318094-c1a2-44a3-8211-b5b22eee3f6d" />
 
 
-✅ **All 11 tests passing** - Atomicity, immutability, and concurrency guarantees validated
+✅ **All 14 tests passing** - Default address consistency, update functionality, atomicity, and concurrency guarantees validated
 
 ### Already Validated
 

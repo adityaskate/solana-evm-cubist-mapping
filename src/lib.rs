@@ -23,8 +23,21 @@ pub struct ProvisionRequest {
     pub chain_id: u64,
 }
 
+#[derive(Deserialize, Clone)]
+pub struct UpdateMappingRequest {
+    pub solana_pubkey: String,
+    pub chain_id: u64,
+    pub new_evm_address: String,
+}
+
 #[derive(Serialize)]
 pub struct ProvisionResponse {
+    pub evm_address: String,
+}
+
+#[derive(Serialize)]
+pub struct UpdateMappingResponse {
+    pub success: bool,
     pub evm_address: String,
 }
 
@@ -44,6 +57,27 @@ fn get_existing_mapping(
     //
     // let bucket = keyvalue::open("solana_to_evm")?;
     // let key = format!("{}:{}", solana_pubkey, chain_id);
+    //
+    // match bucket.get(&key)? {
+    //     Some(Value::String(addr)) => Ok(Some(addr)),
+    //     _ => Ok(None),
+    // }
+
+    Err(anyhow!(
+        "C2F KV not available in local environment"
+    ))
+}
+
+/// Get the default EVM address for a Solana pubkey (chain-agnostic).
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist C2F SDK.
+fn get_default_evm_address(
+    _solana_pubkey: &str,
+) -> Result<Option<String>> {
+    // Example real implementation (C2F):
+    //
+    // let bucket = keyvalue::open("solana_to_evm")?;
+    // let key = format!("default:{}", solana_pubkey);
     //
     // match bucket.get(&key)? {
     //     Some(Value::String(addr)) => Ok(Some(addr)),
@@ -82,18 +116,68 @@ fn store_mapping_once(
     ))
 }
 
+/// Store default EVM address for a Solana pubkey (chain-agnostic).
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist C2F SDK.
+fn store_default_evm_address(
+    _solana_pubkey: &str,
+    _evm_address: &str,
+) -> Result<()> {
+    // Example real implementation (C2F):
+    //
+    // let bucket = keyvalue::open("solana_to_evm")?;
+    // let key = format!("default:{}", solana_pubkey);
+    //
+    // bucket.set(
+    //     &key,
+    //     &Value::from(evm_address),
+    //     IfExists::Deny,
+    // )?;
+    //
+    // Ok(())
+
+    Err(anyhow!(
+        "C2F KV not available in local environment"
+    ))
+}
+
+/// Update mapping for a specific chain (overwrites existing).
+///
+/// NOTE: This is a placeholder. Real implementation requires Cubist C2F SDK.
+fn update_mapping(
+    _solana_pubkey: &str,
+    _chain_id: u64,
+    _evm_address: &str,
+) -> Result<()> {
+    // Example real implementation (C2F):
+    //
+    // let bucket = keyvalue::open("solana_to_evm")?;
+    // let key = format!("{}:{}", solana_pubkey, chain_id);
+    //
+    // bucket.set(
+    //     &key,
+    //     &Value::from(evm_address),
+    //     IfExists::Allow, // Allow overwrite
+    // )?;
+    //
+    // Ok(())
+
+    Err(anyhow!(
+        "C2F KV not available in local environment"
+    ))
+}
+
 /// CubeSigner key creation
 ///
 /// Creates a new Secp256k1 EVM key using CubeSigner CLI.
-/// Tags the key with solana_pubkey and chain_id for tracking.
+/// By default, creates one key per Solana address (chain-agnostic).
 fn create_cubesigner_evm_key(
     solana_pubkey: &str,
-    chain_id: u64,
 ) -> Result<String> {
     use std::process::Command;
     
-    // Generate key material ID based on solana_pubkey and chain_id
-    let key_material_id = format!("EVM_{}_{}", solana_pubkey, chain_id);
+    // Generate key material ID based on solana_pubkey only (not chain-specific)
+    let key_material_id = format!("EVM_{}", solana_pubkey);
     
     // Create Secp256k1 key via CubeSigner CLI
     let output = Command::new("cs")
@@ -133,37 +217,64 @@ fn create_cubesigner_evm_key(
 }
 
 // --------------------------------------------------
-// C2F entrypoint
+// C2F entrypoints
 // --------------------------------------------------
 
 /// Provision (or fetch) an EVM wallet for a Solana wallet + chainId.
 ///
 /// Flow:
-/// 1. Idempotent read from KV
-/// 2. Create CubeSigner EVM key if missing
-/// 3. Atomically store mapping
-/// 4. Return EVM address
+/// 1. Check if chain-specific mapping exists → return it
+/// 2. Check if default EVM address exists → use it for this chain
+/// 3. Create new EVM key (one per Solana address, used across all chains by default)
+/// 4. Store both default and chain-specific mapping
+/// 5. Return EVM address
 ///
 /// This function is intended to run inside Cubist C2F.
 pub fn handle(req: ProvisionRequest) -> Result<ProvisionResponse> {
-    // 1. Check if mapping already exists
-    if let Some(addr) =
-        get_existing_mapping(&req.solana_pubkey, req.chain_id)?
-    {
+    // 1. Check if chain-specific mapping already exists
+    if let Some(addr) = get_existing_mapping(&req.solana_pubkey, req.chain_id)? {
         return Ok(ProvisionResponse { evm_address: addr });
     }
 
-    // 2. Create new EVM wallet via CubeSigner
-    let evm_address =
-        create_cubesigner_evm_key(&req.solana_pubkey, req.chain_id)?;
+    // 2. Check if default EVM address exists (same across all chains)
+    let evm_address = if let Some(addr) = get_default_evm_address(&req.solana_pubkey)? {
+        addr
+    } else {
+        // 3. Create new EVM key (one per Solana address)
+        let addr = create_cubesigner_evm_key(&req.solana_pubkey)?;
+        
+        // Store as default address
+        store_default_evm_address(&req.solana_pubkey, &addr)?;
+        
+        addr
+    };
 
-    // 3. Store mapping atomically (first writer wins)
-    store_mapping_once(
-        &req.solana_pubkey,
-        req.chain_id,
-        &evm_address,
-    )?;
+    // 4. Store chain-specific mapping (points to default address)
+    store_mapping_once(&req.solana_pubkey, req.chain_id, &evm_address)?;
 
     Ok(ProvisionResponse { evm_address })
+}
+
+/// Update the EVM address for a specific chain.
+///
+/// This allows overriding the default EVM address for a particular chain.
+///
+/// Flow:
+/// 1. Validate new_evm_address format
+/// 2. Update chain-specific mapping (overwrites existing)
+/// 3. Return success
+pub fn handle_update_mapping(req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
+    // Validate EVM address format
+    if !req.new_evm_address.starts_with("0x") || req.new_evm_address.len() != 42 {
+        return Err(anyhow!("Invalid EVM address format: {}", req.new_evm_address));
+    }
+
+    // Update the mapping (allows overwrite)
+    update_mapping(&req.solana_pubkey, req.chain_id, &req.new_evm_address)?;
+
+    Ok(UpdateMappingResponse {
+        success: true,
+        evm_address: req.new_evm_address,
+    })
 }
 
