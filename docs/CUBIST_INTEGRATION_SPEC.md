@@ -11,14 +11,29 @@
 We're building a **deterministic Solana → EVM wallet provisioning system** where:
 - **By default:** One Solana wallet maps to the same EVM address across all chains
 - **Optionally:** Can override the default EVM address for specific chains
-- Backend authenticates users via Solana signature verification
-- C2F function handles wallet provisioning (KV lookup + CubeSigner key creation)
+- Backend creates EVM keys via CubeSigner CLI
+- WASM policy handles KV storage operations (store, get, update)
 - All state is stored in Cubist KV
+
+**Architecture:**
+```
+Backend                          CubeSigner
+   │                                 │
+   ├── 1. cs key create ────────────►│ (create EVM key)
+   │◄── 2. returns 0xABC... ─────────┤
+   │                                 │
+   ├── 3. invoke policy ────────────►│ (store mapping)
+   │      {action: "store",          │
+   │       solana_pubkey: "...",     │
+   │       chain_ids: [...],         │
+   │       evm_address: "0xABC"}     │
+   │◄── 4. success ──────────────────┤
+```
 
 **Key requirements:** 
 - Idempotent, atomic provisioning
 - Same EVM address across chains by default (reduces key management complexity)
-- Ability to update mappings for specific chains when needed
+- Ability to update mappings for specific chains when needed (admin only)
 
 ---
 
@@ -73,52 +88,40 @@ default:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU → 0xabc...def  # Used for
 
 ### Key Management
 
-We create **Secp256k1 EVM keys** dynamically using CubeSigner CLI.
+We create **Secp256k1 EVM keys** via CubeSigner CLI in the **backend** (not in the policy).
 
-#### Implementation
+#### Backend Implementation
 
-```rust
-fn create_cubesigner_evm_key(
-    solana_pubkey: &str,
-) -> Result<String> {
-    // Generate unique key material ID (one per Solana address, not per chain)
-    let key_material_id = format!("EVM_{}", solana_pubkey);
-    
-    // Create key via CLI
-    cs key create \
-      --type Secp256k1 \
-      --material-id $key_material_id
-    
-    // Returns: { "key_id": "Key#...", "address": "0x...", ... }
+```bash
+# Create EVM key
+cs key create --key-type secp --metadata '{"name":"EVM_<user_identifier>"}'
+```
+
+**Response:**
+```json
+{
+  "keys": [{
+    "key_id": "Key#0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "key_type": "SecpEthAddr",
+    "material_id": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "metadata": { "name": "EVM_TestUser123" },
+    "purpose": "Evm"
+  }]
 }
 ```
 
-#### Key Material ID Format
-
-```
-EVM_{solana_pubkey}
-```
-
-**Examples:**
-```
-EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU
-EVM_B4fiuy1rJgmbTrraeZpcEtGtFzmt2GVYr1XEoSY7HqqC
-```
-
-**Note:** One EVM key is created per Solana address (chain-agnostic). This key is used across all EVM chains by default, simplifying key management.
+**Key Points:**
+- Keys are created **before** invoking the policy
+- Backend extracts `material_id` from response
+- Policy receives `evm_address` as input parameter
+- One EVM key per Solana address by default (chain-agnostic)
 
 #### Key Lifecycle
 
-- **Creation:** On-demand when provisioning a new Solana → EVM mapping
-- **Usage:** Signing EVM transactions via separate backend calls (not part of provisioning)
+- **Creation:** Backend creates key when user provisions wallet
+- **Storage:** Policy stores mapping in KV
+- **Usage:** Signing EVM transactions via separate backend calls
 - **Deletion:** Never (keys are permanent)
-
-### Questions for Cubist
-
-- Does `cs key create --type Secp256k1` work in C2F environment or only locally?
-- Is the output format consistent (JSON with `address` field)?
-- Can we set custom `material-id` for tracking purposes?
-- How do we authenticate C2F → CubeSigner calls? (implicit via C2F runtime?)
 
 ---
 
@@ -171,72 +174,32 @@ tx.signatures[0] = Buffer.from(sigBase64, "base64");
 
 ---
 
-## 4. C2F Function Specification
+## 4. WASM Policy Specification
 
-### Provision Function
+The policy runs as WASM on CubeSigner and handles three actions: **store**, **get**, and **update**.
 
-#### Input
+### Policy Deployment
 
-```json
-{
-  "solana_pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
-  "chain_id": 1
-}
+```bash
+cd policy
+cargo build --release --target wasm32-wasip2
+cs policy update --name "skate_wallet_provisioner" target/wasm32-wasip2/release/skate_provisioner.wasm
 ```
-
-#### Output (success)
-
-```json
-{
-  "evm_address": "0xabc123..."
-}
-```
-
-#### Logic Flow
-
-```rust
-pub fn handle(req: ProvisionRequest) -> Result<ProvisionResponse> {
-    // 1. Check if chain-specific mapping exists → return it
-    if let Some(addr) = get_existing_mapping(&req.solana_pubkey, req.chain_id)? {
-        return Ok(ProvisionResponse { evm_address: addr });
-    }
-
-    // 2. Check if default EVM address exists (same across all chains)
-    let evm_address = if let Some(addr) = get_default_evm_address(&req.solana_pubkey)? {
-        addr
-    } else {
-        // 3. Create new EVM key (one per Solana address)
-        let addr = create_cubesigner_evm_key(&req.solana_pubkey)?;
-        
-        // Store as default address
-        store_default_evm_address(&req.solana_pubkey, &addr)?;
-        
-        addr
-    };
-
-    // 4. Store chain-specific mapping (points to default address)
-    store_mapping_once(&req.solana_pubkey, req.chain_id, &evm_address)?;
-
-    Ok(ProvisionResponse { evm_address })
-}
-```
-
-**Behavior:**
-- First provision for any chain creates one EVM key
-- Subsequent provisions for other chains reuse the same EVM address
-- Idempotent: calling multiple times returns the same address
 
 ---
 
-### Update Mapping Function
+### Action 1: Store Mappings
+
+Store mappings for a Solana address across multiple chains (called **after** backend creates EVM key).
 
 #### Input
 
 ```json
 {
-  "solana_pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
-  "chain_id": 137,
-  "new_evm_address": "0x1234567890abcdef1234567890abcdef12345678"
+  "action": "store",
+  "solana_pubkey": "TestUser123",
+  "chain_ids": [1, 137, 42161],
+  "evm_address": "0xcb373e47d769b06dee02f05c86dd8790e0358aee"
 }
 ```
 
@@ -245,94 +208,104 @@ pub fn handle(req: ProvisionRequest) -> Result<ProvisionResponse> {
 ```json
 {
   "success": true,
-  "evm_address": "0x1234567890abcdef1234567890abcdef12345678"
+  "evm_address": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+  "chain_mappings": {
+    "1": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "137": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "42161": "0xcb373e47d769b06dee02f05c86dd8790e0358aee"
+  }
 }
 ```
 
-#### Logic Flow
-
-```rust
-pub fn handle_update_mapping(req: UpdateMappingRequest) -> Result<UpdateMappingResponse> {
-    // Validate EVM address format
-    if !req.new_evm_address.starts_with("0x") || req.new_evm_address.len() != 42 {
-        return Err(anyhow!("Invalid EVM address format"));
-    }
-
-    // Update the mapping (allows overwrite)
-    update_mapping(&req.solana_pubkey, req.chain_id, &req.new_evm_address)?;
-
-    Ok(UpdateMappingResponse {
-        success: true,
-        evm_address: req.new_evm_address,
-    })
-}
-```
-
-**Use Case:** Override the default EVM address for a specific chain (e.g., use a different address on Polygon while keeping the same address on Ethereum and Arbitrum)
+**Behavior:**
+- Stores `default:{solana_pubkey}` → `evm_address` (with `IfExists::Deny`)
+- Stores `{solana_pubkey}:{chain_id}` → `evm_address` for each chain (with `IfExists::Deny`)
+- Idempotent: if mappings exist, returns existing values
+- All chains get the same address by default
 
 ---
 
-### Output (error)
+### Action 2: Get Mappings
+
+Retrieve existing mappings for verification.
+
+#### Input
 
 ```json
 {
-  "error": "KV write conflict" | "CubeSigner key creation failed" | "Invalid EVM address format" | ...
+  "action": "get",
+  "solana_pubkey": "TestUser123",
+  "chain_ids": [1, 137, 42161]
 }
 ```
 
-### Concurrency Handling
+#### Output (success)
 
-If two requests for the same `solana_pubkey` arrive simultaneously (different or same chains):
-1. Both read default address (both get `None`)
-2. Both create a CubeSigner key
-3. Both attempt atomic write with `IfExists::Deny` on default address
-4. **First writer wins**, second gets error
-5. Second retries, reads existing default address, uses it
-
-**We accept that one CubeSigner key may be orphaned.** This is acceptable and happens rarely.
-
----
-
-## 5. Backend → C2F Integration
-
-### Authentication
-
-**Our assumption:** Backend authenticates to C2F via one of:
-- API key in `Authorization` header
-- mTLS (mutual TLS)
-- JWT from Cubist identity provider
-
-### Error Handling
-
-| Scenario | Expected Behavior |
-|----------|-------------------|
-| Idempotent request (mapping exists) | Return cached address (200 OK) |
-| First request for Solana address | Create key, store default, return (200 OK) |
-| Request for new chain (default exists) | Reuse default address, return (200 OK) |
-| Update mapping | Override chain-specific mapping, return (200 OK) |
-| Concurrent requests (race) | First wins, second retries and succeeds (200 OK) |
-| CubeSigner API failure | Return error (500), client should retry |
-| KV unavailable | Return error (503), client should retry |
-| Invalid EVM address in update | Return error (400), client fixes input |
+```json
+{
+  "success": true,
+  "default_address": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+  "chain_mappings": {
+    "1": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "137": "0xcb373e47d769b06dee02f05c86dd8790e0358aee",
+    "42161": "0xcb373e47d769b06dee02f05c86dd8790e0358aee"
+  }
+}
+```
 
 ---
 
-## 6. Deployment & Environment
+### Action 3: Update Chain Mapping (Admin Only)
 
-### C2F Deployment
+Override the EVM address for a specific chain.
 
-- **Runtime:** Cubist-managed (WASM? serverless?)
-- **Code:** We provide `src/lib.rs` compiled to C2F-compatible format
-- **Dependencies:** Cubist C2F SDK (KV, CubeSigner client)
+#### Input
 
-### Backend Deployment
+```json
+{
+  "action": "update",
+  "solana_pubkey": "7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU",
+  "chain_id": 137,
+  "new_evm_address": "0xb29db776e2f8e38dcb2da1ee6f92dd1208874424"
+}
+```
 
-- **Runtime:** Node.js on our infrastructure
-- **Dependencies:** `@solana/web3.js`, `tweetnacl`
-- **Secrets:** C2F API key/credentials (stored in our secret manager)
+#### Output (success)
 
+```json
+{
+  "success": true,
+  "new_evm_address": "0xb29db776e2f8e38dcb2da1ee6f92dd1208874424",
+  "chain_id": 137
+}
+```
 
-## 7. Security Considerations
+**Behavior:**
+- Validates EVM address format (0x + 40 hex chars)
+- Verifies Solana address has been provisioned (default exists)
+- Updates `{solana_pubkey}:{chain_id}` mapping with `IfExists::Overwrite`
+- Other chains remain unchanged
+
+---
+
+### Error Responses
+
+```json
+{
+  "success": false,
+  "error": "<error message>"
+}
+```
+
+**Common errors:**
+- `"chain_ids cannot be empty"` (store action)
+- `"Invalid EVM address format: <address>"` (store/update actions)
+- `"Solana address <pubkey> not provisioned"` (update action)
+- `"KV write error: ..."` (storage failures)
+
+---
+
+## 5. Security Considerations
 
 ### Solana Signature Verification (Backend)
 
@@ -340,11 +313,12 @@ If two requests for the same `solana_pubkey` arrive simultaneously (different or
 - Ed25519 verification via `tweetnacl.sign.detached.verify`
 - No private keys on backend — only signature verification
 
-### C2F Isolation
+### Policy Isolation
 
-- Backend never touches CubeSigner credentials
-- C2F is the only component with CubeSigner access
-- KV is only accessible from C2F (not from public internet)
+- Backend creates keys via CubeSigner CLI
+- Policy only handles KV operations (store/get/update)
+- KV is only accessible from policy (not from public internet)
+- Admin update action should have additional authorization checks
 
 ### Key Immutability & Flexibility
 
@@ -355,15 +329,14 @@ If two requests for the same `solana_pubkey` arrive simultaneously (different or
 
 ### Race Condition Handling
 
-- Concurrent provisions may create multiple CubeSigner keys (acceptable)
-- Only first write to KV succeeds (atomic `IfExists::Deny`)
-- Losing requests retry and receive the winning address
-- System eventually converges to single mapping per (solana_pubkey, chain_id)
-- **Verified by tests:** `test_concurrent_provisions_first_writer_wins`, `test_retry_after_race_condition`
+- Atomic `IfExists::Deny` prevents duplicate mappings
+- First write wins for default address and chain mappings
+- System converges to single mapping per (solana_pubkey, chain_id)
+- **Verified by tests:** `test_concurrent_provisions_first_writer_wins`, `test_atomicity_prevents_overwrites_on_provision`
 
 ---
 
-## 8. Testing & Validation
+## 6. Testing & Validation
 
 ### Test Coverage
 
@@ -450,58 +423,32 @@ cargo test test_wallet_address_immutability
 <img width="984" height="603" alt="image" src="https://github.com/user-attachments/assets/35318094-c1a2-44a3-8211-b5b22eee3f6d" />
 
 
-✅ **All 14 tests passing** - Default address consistency, update functionality, atomicity, and concurrency guarantees validated
+✅ **All 16 tests passing** - Default address consistency, update functionality, atomicity, and concurrency guarantees validated
 
-### Already Validated
+### Production Validated ✅
 
-| Component | Method |
+| Component | Status |
 |-----------|--------|
-| Solana signing | Working end-to-end with CubeSigner CLI |
-| C2F logic | Tested locally with mocked KV store |
-| Concurrency | Stress-tested first-writer-wins semantics |
+| Solana signing | Working with CubeSigner CLI |
+| Policy logic | Tested with mock KV + deployed to production |
+| Store action | Verified in production |
+| Get action | Verified in production |
+| Update action | Verified in production |
 | Backend auth | Ed25519 verification working |
 
-### Pending Validation
+---
 
-| Component | Blocker |
-|-----------|---------|
-| Real KV operations | Need C2F runtime access |
-| CubeSigner key creation | Need API documentation |
-| End-to-end flow | Need deployed C2F endpoint |
+## 7. Code References
+
+- **WASM Policy:** `policy/src/main.rs` (deployed to CubeSigner)
+- **Type definitions:** `src/lib.rs` (used by tests)
+- **Tests:** `tests/atomicity_tests.rs` (16 tests, all passing)
+- **Backend Solana auth:** `backend/solana-auth.ts`
+- **Solana signing example:** `backend/send_usdc_usdt_batched_with_cubist.ts`
 
 ---
 
-## 9. Open Questions Summary
-
-**KV Store:**
-1. Exact API for `IfExists::Deny` (atomicity guarantees)
-2. Consistency model (strong vs eventual)
-3. Bucket creation process (manual or programmatic)
-
-**CubeSigner:**
-4. API for creating Secp256k1 keys from C2F
-5. Key metadata support
-6. Rate limits on key creation
-7. Authentication mechanism (C2F → CubeSigner)
-
-**C2F:**
-8. Deployment process and tooling
-9. Staging environment availability
-10. Backend → C2F authentication mechanism (API key, mTLS, JWT)
-11. Retry logic (built-in or manual)
-12. Function versioning/rollback support
-
----
-
-## Appendix: Code References
-
-- **C2F provisioning logic:** `src/lib.rs`
-- **Backend Solana auth:** `backend-example/solana-auth.ts`
-- **Working Solana signing example:** `backend-example/send_usdc_usdt_batched_with_cubist.ts`
-
----
-
-## 10. Live Testing Flow (Production Validated ✅)
+## 8. Live Testing Flow (Production Validated ✅)
 
 The complete provisioning system has been tested on production CubeSigner. Below is the step-by-step flow with commands.
 
