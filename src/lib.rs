@@ -90,17 +90,52 @@ fn store_mapping_once(
 
 /// CubeSigner key creation
 ///
-/// This is intentionally isolated so that integration is mechanical.
-/// Once CubeSigner wiring is decided, only this function changes.
-///
-/// NOTE: This is a placeholder. Real implementation requires Cubist CubeSigner SDK.
+/// Creates a new Secp256k1 EVM key using CubeSigner CLI.
+/// Tags the key with solana_pubkey and chain_id for tracking.
 fn create_cubesigner_evm_key(
-    _solana_pubkey: &str,
-    _chain_id: u64,
+    solana_pubkey: &str,
+    chain_id: u64,
 ) -> Result<String> {
-    Err(anyhow!(
-        "CubeSigner integration not wired yet (intentional)"
-    ))
+    use std::process::Command;
+    
+    // Generate key material ID based on solana_pubkey and chain_id
+    let key_material_id = format!("EVM_{}_{}", solana_pubkey, chain_id);
+    
+    // Create Secp256k1 key via CubeSigner CLI
+    let output = Command::new("cs")
+        .args(&[
+            "key",
+            "create",
+            "--type", "Secp256k1",
+            "--material-id", &key_material_id,
+        ])
+        .output()
+        .map_err(|e| anyhow!("Failed to execute CubeSigner CLI: {}", e))?;
+    
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("CubeSigner key creation failed: {}", stderr));
+    }
+    
+    // Parse output to extract EVM address
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Expected output format (JSON):
+    // { "key_id": "Key#...", "address": "0x...", ... }
+    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+        .map_err(|e| anyhow!("Failed to parse CubeSigner output: {}", e))?;
+    
+    let address = parsed["address"]
+        .as_str()
+        .ok_or_else(|| anyhow!("No address field in CubeSigner response"))?
+        .to_string();
+    
+    // Validate it's a proper EVM address (0x + 40 hex chars)
+    if !address.starts_with("0x") || address.len() != 42 {
+        return Err(anyhow!("Invalid EVM address format: {}", address));
+    }
+    
+    Ok(address)
 }
 
 // --------------------------------------------------

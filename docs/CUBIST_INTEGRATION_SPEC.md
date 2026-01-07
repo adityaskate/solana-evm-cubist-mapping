@@ -66,28 +66,43 @@ Bucket name: solana_to_evm
 
 ### Key Management
 
-We need to create **Secp256k1 EVM keys** dynamically from C2F.
+We create **Secp256k1 EVM keys** dynamically using CubeSigner CLI.
 
-#### Required API (assumed shape)
+#### Implementation
 
 ```rust
-// Pseudocode - adjust to actual CubeSigner SDK
-fn create_evm_key(metadata: KeyMetadata) -> Result<EvmKeyInfo> {
-    // Returns: { address: "0x...", key_id: "..." }
+fn create_cubesigner_evm_key(
+    solana_pubkey: &str,
+    chain_id: u64,
+) -> Result<String> {
+    // Generate unique key material ID
+    let key_material_id = format!("EVM_{}_{}", solana_pubkey, chain_id);
+    
+    // Create key via CLI
+    cs key create \
+      --type Secp256k1 \
+      --material-id $key_material_id
+    
+    // Returns: { "key_id": "Key#...", "address": "0x...", ... }
 }
 ```
 
-#### Key Metadata
+#### Key Material ID Format
 
-We want to tag each created key with:
-```rust
-{
-  "solana_pubkey": "7xKXtg...",
-  "chain_id": 1,
-  "created_at": "2026-01-07T12:00:00Z",
-  "purpose": "solana_evm_mapping"
-}
 ```
+EVM_{solana_pubkey}_{chain_id}
+```
+
+**Examples:**
+```
+EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU_1
+EVM_7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU_137
+```
+
+This ensures:
+- Deterministic key IDs for tracking
+- Easy lookup of which Solana wallet maps to which EVM key
+- Unique keys per (solana_pubkey, chain_id) combination
 
 #### Key Lifecycle
 
@@ -97,9 +112,9 @@ We want to tag each created key with:
 
 ### Questions for Cubist
 
-- What is the exact API for creating Secp256k1 keys from C2F?
-- Can we attach custom metadata to keys?
-- Is there a rate limit on key creation?
+- Does `cs key create --type Secp256k1` work in C2F environment or only locally?
+- Is the output format consistent (JSON with `address` field)?
+- Can we set custom `material-id` for tracking purposes?
 - How do we authenticate C2F → CubeSigner calls? (implicit via C2F runtime?)
 
 ---
